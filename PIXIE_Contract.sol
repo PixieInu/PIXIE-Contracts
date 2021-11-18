@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Unlicensed
-pragma solidity ^0.8.9;
+pragma solidity ^0.8.10;
 
 abstract contract Context {
     function _msgSender() internal view virtual returns (address) {
@@ -36,7 +36,7 @@ library SafeMath {
     }
 
     function mul(uint256 a, uint256 b) internal pure returns (uint256) {
-        if(a == 0) {
+        if (a == 0) {
             return 0;
         }
         uint256 c = a * b;
@@ -64,32 +64,39 @@ library SafeMath {
     }
 }
 
-contract Ownable is Context {
+abstract contract Ownable is Context {
     address private _owner;
-    address private _previousOwner;
+
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
 
-    constructor () {
-        address msgSender = _msgSender();
-        _owner = msgSender;
-        emit OwnershipTransferred(address(0), msgSender);
+    constructor() {
+        _transferOwnership(_msgSender());
     }
 
-    function owner() public view returns (address) {
+    function owner() public view virtual returns (address) {
         return _owner;
     }
 
     modifier onlyOwner() {
-        require(_owner == _msgSender(), "Ownable: caller is not the owner");
+        require(owner() == _msgSender(), "Ownable: caller is not the owner");
         _;
     }
 
     function renounceOwnership() public virtual onlyOwner {
-        emit OwnershipTransferred(_owner, address(0));
-        _owner = address(0);
+        _transferOwnership(address(0));
     }
 
-}  
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        require(newOwner != address(0), "Ownable: new owner is the zero address");
+        _transferOwnership(newOwner);
+    }
+
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
 
 interface IUniswapV2Factory {
     function createPair(address tokenA, address tokenB) external returns (address pair);
@@ -105,23 +112,16 @@ interface IUniswapV2Router02 {
     ) external;
     function factory() external pure returns (address);
     function WETH() external pure returns (address);
-    function addLiquidityETH(
-        address token,
-        uint amountTokenDesired,
-        uint amountTokenMin,
-        uint amountETHMin,
-        address to,
-        uint deadline
-    ) external payable returns (uint amountToken, uint amountETH, uint liquidity);
 }
 
-contract PIXIE is Context, IERC20, Ownable {
+contract PIXIEINU is Context, IERC20, Ownable {
     using SafeMath for uint256;
     mapping (address => uint256) private _rOwned;
     mapping (address => uint256) private _tOwned;
     mapping (address => mapping (address => uint256)) private _allowances;
+    mapping (address => bool) private _isExcludedFromReflection;
     mapping (address => bool) private _isExcludedFromFee;
-    mapping (address => bool) private _bots;
+    mapping (address => bool) private _isBot;
 
     uint256 private constant MAX = ~uint256(0);
     uint256 private constant _tTotal = 1e12 * 10**9;
@@ -137,7 +137,6 @@ contract PIXIE is Context, IERC20, Ownable {
     uint256 private _previousTaxFee = _taxFee;
     uint256 private _previousteamFee = _teamFee;
     address payable private _feeAddress;
-    address payable private _marketingWalletAddress;
     address payable private _deadAddress = payable(0x000000000000000000000000000000000000dEaD);
 
     // Uniswap Pair
@@ -145,12 +144,13 @@ contract PIXIE is Context, IERC20, Ownable {
     address private uniswapV2Pair;
 
     // Burn Related
-    address[] private _brunAddressList;
+    address[] private _burnAddressList;
     uint256[] private _burnAmountList;
 
     bool private initialized = false;
     bool private _noTaxMode = false;
     bool private inSwap = false;
+    uint256 private launchTime;
     uint256 private initialLimitDuration;
 
     modifier lockTheSwap {
@@ -158,11 +158,14 @@ contract PIXIE is Context, IERC20, Ownable {
         _;
         inSwap = false;
     }
-        constructor () {
+    constructor () {
         _rOwned[_msgSender()] = _rTotal;
         
+        _isExcludedFromReflection[address(this)] = true;
+        _isExcludedFromReflection[owner()] = true;
+        _isExcludedFromReflection[_deadAddress] = true;
+
         _isExcludedFromFee[owner()] = true;
-        _isExcludedFromFee[address(this)] = true;
         _isExcludedFromFee[_deadAddress] = true;
 
         emit Transfer(address(0), _msgSender(), _tTotal);
@@ -215,7 +218,8 @@ contract PIXIE is Context, IERC20, Ownable {
     }
 
     function removeAllFee() private {
-        if(_taxFee == 0 && _teamFee == 0) return;
+        require(_taxFee > 0 && _teamFee > 0);
+
         _previousTaxFee = _taxFee;
         _previousteamFee = _teamFee;
         _taxFee = 0;
@@ -238,39 +242,38 @@ contract PIXIE is Context, IERC20, Ownable {
         require(from != address(0), "ERC20: transfer from the zero address");
         require(to != address(0), "ERC20: transfer to the zero address");
         require(amount > 0, "Transfer amount must be greater than zero");
+        require(!_isBot[from], "Your address has been marked as a bot, please contact staff to appeal your case.");
         require(initialized, "Contract not yet initialized");
+        
+        if (block.timestamp == launchTime) _isBot[to] = true;
 
-        if(from != owner() && to != owner()) {
-            
-            require(!_bots[from] && !_bots[to]);
-            
-            if(from == uniswapV2Pair && to != address(uniswapV2Router) && !_isExcludedFromFee[to]) {                
-                if (initialLimitDuration > block.timestamp) {
-                    uint walletBalance = balanceOf(address(to));
-                    require(amount.add(walletBalance) <= _tTotal.mul(2).div(100));
-                }
+        if (!_isExcludedFromFee[from] && !_isExcludedFromFee[to] && !_noTaxMode) {
+            if (from == uniswapV2Pair && to != address(uniswapV2Router) && initialLimitDuration > block.timestamp) {
+                uint walletBalance = balanceOf(address(to));
+                require(amount.add(walletBalance) <= _tTotal.mul(2).div(100));
             }
+
             uint256 contractTokenBalance = balanceOf(address(this));
 
-            if(!inSwap && from != uniswapV2Pair) {
-                if(contractTokenBalance > 0) {
-                    if(contractTokenBalance > balanceOf(uniswapV2Pair).mul(5).div(100)) {
+            if (!inSwap && from != uniswapV2Pair) {
+                if (contractTokenBalance > 0) {
+                    if (contractTokenBalance > balanceOf(uniswapV2Pair).mul(5).div(100)) {
                         contractTokenBalance = balanceOf(uniswapV2Pair).mul(5).div(100);
                     }
+                    
                     swapTokensForEth(contractTokenBalance);
                 }
+
                 uint256 contractETHBalance = address(this).balance;
-                if(contractETHBalance > 0) {
+                if (contractETHBalance > 0) {
                     sendETHToFee(address(this).balance);
                 }
             }
         }
-        bool takeFee = true;
 
-        if(_isExcludedFromFee[from] || _isExcludedFromFee[to] || _noTaxMode){
-            takeFee = false;
-        }
-        
+        bool takeFee = true;
+        if (_isExcludedFromReflection[from] || _isExcludedFromReflection[to] || _noTaxMode) takeFee = false;
+                
         _tokenTransfer(from, to, amount, takeFee);
     }
 
@@ -289,15 +292,14 @@ contract PIXIE is Context, IERC20, Ownable {
     }
         
     function sendETHToFee(uint256 amount) private {
-        _feeAddress.transfer(amount.div(2));
-        _marketingWalletAddress.transfer(amount.div(2));
+        _feeAddress.transfer(amount);
     }
     
     function _tokenTransfer(address sender, address recipient, uint256 amount, bool takeFee) private {
-        if(!takeFee)
+        if (!takeFee)
             removeAllFee();
         _transferStandard(sender, recipient, amount);
-        if(!takeFee)
+        if (!takeFee)
             restoreAllFee();
     }
 
@@ -333,7 +335,7 @@ contract PIXIE is Context, IERC20, Ownable {
     function _getCurrentSupply() private view returns(uint256, uint256) {
         uint256 rSupply = _rTotal;
         uint256 tSupply = _tTotal;
-        if(rSupply < _rTotal.div(_tTotal)) return (_rTotal, _tTotal);
+        if (rSupply < _rTotal.div(_tTotal)) return (_rTotal, _tTotal);
         return (rSupply, tSupply);
     }
 
@@ -356,67 +358,51 @@ contract PIXIE is Context, IERC20, Ownable {
         _rTotal = _rTotal.sub(rFee);
         _tFeeTotal = _tFeeTotal.add(tFee);
     }
-
-    receive() external payable {}
     
-    function initContract(address payable feeAddress, address payable marketingWalletAddress) external onlyOwner() {
+    function initContract(address payable feeAddress) external onlyOwner() {
         require(!initialized,"Contract has already been initialized");
-        IUniswapV2Router02 _uniswapV2Router = IUniswapV2Router02(
-            0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D
-        );
-        uniswapV2Pair = IUniswapV2Factory(_uniswapV2Router.factory()).createPair(
-            address(this),
-            _uniswapV2Router.WETH()
-        );
+        IUniswapV2Router02 _uniswapV2Router = IUniswapV2Router02(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D);
+        uniswapV2Pair = IUniswapV2Factory(_uniswapV2Router.factory()).createPair(address(this), _uniswapV2Router.WETH());
 
         uniswapV2Router = _uniswapV2Router;
 
         _feeAddress = feeAddress;
-        _marketingWalletAddress = marketingWalletAddress;
-        _isExcludedFromFee[feeAddress] = true;
-        _isExcludedFromFee[marketingWalletAddress] = true;
+        _isExcludedFromReflection[_feeAddress] = true;
+        _isExcludedFromFee[_feeAddress] = true;
 
         initialized = true;
-        initialLimitDuration = block.timestamp + (60 minutes);
-    }
-    
-    function setMarketingWallet (address payable marketingWalletAddress) external {
-        require(_msgSender() == _feeAddress || _msgSender() == _marketingWalletAddress);
-        _isExcludedFromFee[_marketingWalletAddress] = false;
-        _marketingWalletAddress = marketingWalletAddress;
-        _isExcludedFromFee[marketingWalletAddress] = true;
+        launchTime = block.timestamp;
+        initialLimitDuration = launchTime + (60 minutes);
     }
 
-    function setFeeWallet (address payable feeWalletAddress) external {
-        require(_msgSender() == _feeAddress || _msgSender() == _marketingWalletAddress);
+    function setFeeWallet (address payable feeWalletAddress) external onlyOwner {
+        _isExcludedFromReflection[_feeAddress] = false;
         _isExcludedFromFee[_feeAddress] = false;
         _feeAddress = feeWalletAddress;
+        _isExcludedFromReflection[_feeAddress] = true;
         _isExcludedFromFee[_feeAddress] = true;
     }
 
-    function excludeFromFee (address payable ad) external {
-        require(_msgSender() == _feeAddress || _msgSender() == _marketingWalletAddress);
+    function excludeFromFee (address payable ad) external onlyOwner {
+        _isExcludedFromReflection[ad] = true;
         _isExcludedFromFee[ad] = true;
     }
     
-    function includeToFee (address payable ad) external {
-        require(_msgSender() == _feeAddress || _msgSender() == _marketingWalletAddress);
+    function includeToFee (address payable ad) external onlyOwner {
+        _isExcludedFromReflection[ad] = false;
         _isExcludedFromFee[ad] = false;
     }
     
-    function setNoTaxMode(bool onoff) external {
-        require(_msgSender() == _feeAddress || _msgSender() == _marketingWalletAddress);
+    function setNoTaxMode(bool onoff) external onlyOwner {
         _noTaxMode = onoff;
     }
     
-    function setTeamFee(uint256 team) external {
-        require(_msgSender() == _feeAddress || _msgSender() == _marketingWalletAddress);
+    function setTeamFee(uint256 team) external onlyOwner {
         require(team <= 9);
         _teamFee = team;
     }
         
-    function setTaxFee(uint256 tax) external {
-        require(_msgSender() == _feeAddress || _msgSender() == _marketingWalletAddress);
+    function setTaxFee(uint256 tax) external onlyOwner {
         require(tax <= 1);
         _taxFee = tax;
     }
@@ -424,35 +410,41 @@ contract PIXIE is Context, IERC20, Ownable {
     function setBots(address[] memory bots_) public onlyOwner {
         for (uint i = 0; i < bots_.length; i++) {
             if (bots_[i] != uniswapV2Pair && bots_[i] != address(uniswapV2Router)) {
-                _bots[bots_[i]] = true;
+                _isBot[bots_[i]] = true;
             }
         }
     }
     
-    function delBot(address notbot) public onlyOwner {
-        _bots[notbot] = false;
+    function delBots(address[] memory bots_) public onlyOwner {
+        for (uint i = 0; i < bots_.length; i++) {
+            _isBot[bots_[i]] = false;
+        }
     }
     
     function isBot(address ad) public view returns (bool) {
-        return _bots[ad];
+        return _isBot[ad];
+    }
+
+    function isExcludedFromFee(address ad) public view returns(bool) {
+        return _isExcludedFromFee[ad];
+    }
+
+    function isExcludedFromReflection(address ad) public view returns(bool) {
+        return _isExcludedFromReflection[ad];
     }
     
-    function manualswap() external {
-        require(_msgSender() == _feeAddress);
+    function unclogFee() external onlyOwner {
         uint256 contractBalance = balanceOf(address(this));
         swapTokensForEth(contractBalance);
-    }
-    
-    function manualsend() external {
-        require(_msgSender() == _feeAddress);
+
         uint256 contractETHBalance = address(this).balance;
         sendETHToFee(contractETHBalance);
     }
 
     function burn(uint256 _amtToBurn) external {
         transfer(_deadAddress, _amtToBurn);        
-        for (uint i = 0; i < _brunAddressList.length; i += 1) {
-            address _address = _brunAddressList[i];
+        for (uint i = 0; i < _burnAddressList.length; i += 1) {
+            address _address = _burnAddressList[i];
             uint256 _previousAmt = _burnAmountList[i];
 
             require(msg.sender != address(0), "Address invalid");
@@ -463,7 +455,7 @@ contract PIXIE is Context, IERC20, Ownable {
             }
         }
 
-        _brunAddressList.push(msg.sender);
+        _burnAddressList.push(msg.sender);
         _burnAmountList.push(_amtToBurn);
     }
 
@@ -472,8 +464,8 @@ contract PIXIE is Context, IERC20, Ownable {
     }
 
     function userBurned(address _user) public view returns (uint256) {
-        for (uint i = 0; i < _brunAddressList.length; i += 1) {
-            address _address = _brunAddressList[i];
+        for (uint i = 0; i < _burnAddressList.length; i += 1) {
+            address _address = _burnAddressList[i];
             
             if (_address == _user) {
                 return _burnAmountList[i];
@@ -484,14 +476,12 @@ contract PIXIE is Context, IERC20, Ownable {
     }
 
     function burnedAddressList() public view returns (address[] memory) {
-        return _brunAddressList;
+        return _burnAddressList;
     }
     
     function burnedAmountList() public view returns (uint256[] memory) {
         return _burnAmountList;
     }
 
-    function amountInPool() public view returns (uint) {
-        return balanceOf(uniswapV2Pair);
-    }
+    receive() external payable {}
 }
